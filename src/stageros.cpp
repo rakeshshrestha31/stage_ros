@@ -46,6 +46,7 @@
 #include <sensor_msgs/Image.h>
 #include <sensor_msgs/image_encodings.h>
 #include <sensor_msgs/CameraInfo.h>
+#include <sensor_msgs/PointCloud.h>
 #include <nav_msgs/Odometry.h>
 #include <geometry_msgs/Twist.h>
 #include <rosgraph_msgs/Clock.h>
@@ -63,6 +64,7 @@
 #define BASE_SCAN "laserscan"
 #define BASE_POSE_GROUND_TRUTH "pose_ground_truth"
 #define CMD_VEL "cmd_vel"
+#define FIDUCIALS "fiducials"
 
 // Our node
 class StageNode
@@ -89,11 +91,18 @@ private:
     ros::Publisher ground_truth_pub;
     ros::Subscriber cmdvel_sub; 
   };
-  
+
+  struct FiducialSensor
+  {
+    StageNode* node; // this
+    ros::Publisher fiducials_pub;
+  };
   
   // Used to remember initial poses for soft reset
   std::vector<Stg::ModelPosition *> positionmodels;  
   std::vector<Stg::Pose> initial_poses;
+  std::vector<Stg::ModelFiducial *> fiducial_sensors;
+
   ros::ServiceServer reset_srv_;
   
   ros::Publisher clock_pub_;
@@ -116,6 +125,11 @@ private:
 
   static bool s_update_position( Stg::ModelPosition* mod, Position* p ){
     p->node->PositionCallback( mod, p );    
+    return false; // thankyou, call again
+  } 
+
+  static bool s_update_fiducials( Stg::ModelFiducial* mod, FiducialSensor* f ){
+    f->node->FiducialCallback( mod, f );    
     return false; // thankyou, call again
   } 
 
@@ -150,6 +164,7 @@ public:
   void WorldCallback();  
   void RangerCallback( Stg::ModelRanger* mod, Ranger* r );
   void PositionCallback( Stg::ModelPosition* mod, Position* p );
+  void FiducialCallback( Stg::ModelFiducial* mod, FiducialSensor* f );
   
   // Do one update of the world.  May pause if the next update time
   // has not yet arrived.
@@ -229,6 +244,21 @@ StageNode::ImportModel(Stg::Model* mod )
     }
   else if (dynamic_cast<Stg::ModelCamera *>(mod)) {
     ROS_WARN( "STAGEROS WARN: Camera models/topics not currently supported" );
+  }
+  else if (dynamic_cast<Stg::ModelFiducial *>(mod)) {
+    Stg::ModelFiducial * mf = dynamic_cast<Stg::ModelFiducial *>(mod);
+    assert(mf);
+    
+    FiducialSensor* f = new FiducialSensor;
+    assert( f );    
+    f->node = this;
+    f->fiducials_pub = n_.advertise<sensor_msgs::PointCloud>(mapName(FIDUCIALS, mf), 10); // TODO - replace 0 with fiducial number
+
+    mf->AddCallback( Stg::Model::CB_UPDATE,
+		     (Stg::model_callback_t)s_update_fiducials,
+		     (void*)f );
+
+    mf->Subscribe(); // TODO: wait until someone needs the data
   }
 }
 
@@ -478,6 +508,54 @@ void StageNode::PositionCallback( Stg::ModelPosition* mod, Position* p )
   p->ground_truth_pub.publish(ground_truth_msg);
 }
 
+void 
+StageNode::FiducialCallback( Stg::ModelFiducial* mod, FiducialSensor* f )
+{
+  assert(mod);
+  assert(f);
+  
+  boost::mutex::scoped_lock lock(msg_lock);
+  
+  this->sim_time.fromSec(world->SimTimeNow() / 1e6);
+  // We're not allowed to publish clock==0, because it used as a special
+  // value in parts of ROS, #4027.
+  if(this->sim_time.sec == 0 && this->sim_time.nsec == 0)
+    {
+      ROS_DEBUG("Ranger skipping initial simulation step, to avoid publishing clock==0");
+      return;
+    }
+  
+  const std::vector<Stg::ModelFiducial::Fiducial>& fiducials = mod->GetFiducials();
+  
+  sensor_msgs::PointCloud msg;
+  msg.header.frame_id = mapName("base_fiducial_link", mod->Parent() );
+  msg.header.stamp = sim_time;
+
+  for (size_t i=0, len=fiducials.size(); i < len; i++)
+  {
+    geometry_msgs::Point32 point;
+    const Stg::ModelFiducial::Fiducial &fiducial = fiducials[i];
+
+    Stg::Pose pose = fiducials[i].geom;
+    point.x = fiducial.range * std::cos(fiducial.bearing);
+    point.y = fiducial.range * std::sin(fiducial.bearing);
+    point.z = 0;
+    msg.points.push_back(point);
+  }
+
+  f->fiducials_pub.publish(msg);
+  
+  // Also publish the base->base_fiducial_link Tx.  This could eventually move
+  // into being retrieved from the param server as a static Tx.
+  Stg::Pose fp = mod->GetPose();
+  tf::Quaternion fiducialQ;
+  fiducialQ.setRPY(0.0, 0.0, fp.a);
+  tf::Transform txFiducial =  tf::Transform(fiducialQ, tf::Point(fp.x, fp.y, mod->Parent()->GetGeom().size.z + fp.z));
+  
+  tf.sendTransform(tf::StampedTransform(txFiducial, sim_time,
+					mapName("base_link", mod->Parent() ),
+					mapName("base_fiducial_link", mod->Parent())));
+}
 
 void
 StageNode::WorldCallback()
